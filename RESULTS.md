@@ -1,26 +1,12 @@
 # Results — tsql-databricks-converter
 
-Outcome of running the accelerator end to end on a real Microsoft SQL Server export
-(5,156 objects), run fresh from raw T-SQL with parameters only.
+Outcome of running the accelerator end to end on a real Microsoft SQL Server export, run fresh from raw T-SQL with parameters only.
 
 ## Headline
 
-**90.5% of all objects converted and binding-validated automatically** (4,658 / 5,146),
-on a clean run from raw input. The remaining 488 objects (9.5%) are emitted to a classified
+**90.5% of all objects converted and binding-validated automatically**,
+on a clean run from raw input. The remaining objects (9.5%) are emitted to a classified
 manual-review queue, concentrated in complex stored procedures and cross-database views.
-
-| Object type | Source | Converted | Validated | Success | Rate |
-|-------------|-------:|----------:|----------:|--------:|-----:|
-| Schemas    | 89    | 89    | 89    | 89    | 100.0% |
-| Tables     | 2,340 | 2,340 | 2,340 | 2,279 | 97.4% |
-| Functions  | 400   | 397   | 397   | 354   | 89.2% |
-| Views      | 1,042 | 1,042 | 1,042 | 871   | 83.6% |
-| Procedures | 1,283 | 1,276 | 1,276 | 1,065 | 83.5% |
-| Synonyms   | 2     | 2     | 2     | 0     | 0.0% |
-| **Total**  | **5,156** | **5,146** | **5,146** | **4,658** | **90.5%** |
-
-"Success" = binding-validates clean (`pass`), or its only unresolved references are objects
-outside the exported set (`unresolved_ext_dep` / `sound_dep`) — a sound conversion, not a failure.
 
 ## Portability — proven across clouds
 
@@ -39,7 +25,7 @@ all parameters with neutral defaults. The accelerator is cloud- and tenant-agnos
 - **sqlglot** (deterministic, free): tables, views, schemas — the mechanical bulk.
 - **Tiered LLM** (`ai_query`, Haiku → Sonnet → Opus by complexity): procedures, procedural
   functions, and anything sqlglot cannot fully transpile.
-- On this run: ~2,200 objects via sqlglot, ~2,900 via the LLM (the split shifts as sqlglot
+- On this run: ~40% objects via sqlglot, ~60% via the LLM (the split shifts as sqlglot
   misses route to the model).
 
 ## Bugs found and fixed (surfaced by cross-environment testing)
