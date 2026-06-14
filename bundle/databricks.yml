@@ -1,0 +1,84 @@
+# tsql-databricks-converter — portable SQL Server (T-SQL) -> Databricks migration accelerator
+#
+# A multi-task Databricks job that converts an entire T-SQL codebase to Databricks
+# SQL / PySpark using a sqlglot (deterministic) + tiered-LLM (ai_query) hybrid, then
+# binding-validates and repairs the output. Nothing is hardcoded to a customer,
+# catalog, or workspace — everything is a job parameter.
+#
+#   databricks bundle deploy -t <target> --profile <profile>
+#   databricks bundle run tsql_migration -t <target> --profile <profile>
+#
+# Stage independently (e.g. re-run only validate+repair) by triggering those tasks.
+bundle:
+  name: tsql-databricks-converter
+
+variables:
+  catalog:        {description: Target Unity Catalog, default: main}
+  schema:         {description: Schema for all migration artifacts, default: tsql_migration}
+  warehouse_id:   {description: Large multi-cluster SQL warehouse for validation fan-out, default: ""}
+  raw_sql_path:   {description: UC Volume holding the DDL-scripting export, default: ""}
+  source_dialect: {description: sqlglot source dialect, default: tsql}
+  fraction:       {description: Fraction of objects to validate (staged rollout), default: "1.0"}
+  repair_iterations: {default: "2"}
+  scratch_prefix: {default: _migrate_scratch__}
+
+targets:
+  # Fill in workspace.host (or pass --profile) and the variables for your org.
+  dev:
+    mode: development
+    default: true
+    # workspace:
+    #   host: https://<your-workspace>.cloud.databricks.com
+    # variables:
+    #   catalog: <your_catalog>          # must allow CREATE SCHEMA (or set scratch_catalog)
+    #   schema: tsql_migration
+    #   warehouse_id: "<sql_warehouse_id>"   # large multi-cluster SQL warehouse
+    #   raw_sql_path: /Volumes/<catalog>/<schema>/raw_sql
+
+  prod:
+    mode: production
+    # workspace:
+    #   host: https://<your-workspace>.cloud.databricks.com
+
+resources:
+  jobs:
+    tsql_migration:
+      name: "[${bundle.target}] T-SQL → Databricks Migration"
+      # Job-level parameters are visible to every task notebook as widgets.
+      parameters:
+        - {name: catalog,        default: "${var.catalog}"}
+        - {name: schema,         default: "${var.schema}"}
+        - {name: warehouse_id,   default: "${var.warehouse_id}"}
+        - {name: raw_sql_path,   default: "${var.raw_sql_path}"}
+        - {name: source_dialect, default: "${var.source_dialect}"}
+        - {name: fraction,       default: "${var.fraction}"}
+        - {name: repair_iterations, default: "${var.repair_iterations}"}
+        - {name: scratch_prefix, default: "${var.scratch_prefix}"}
+      queue: {enabled: true}
+      tasks:
+        - task_key: ingest
+          notebook_task: {notebook_path: ./src/tasks/01_ingest.py}
+        - task_key: transpile
+          depends_on: [{task_key: ingest}]
+          notebook_task: {notebook_path: ./src/tasks/02_transpile.py}
+        - task_key: convert
+          depends_on: [{task_key: transpile}]
+          notebook_task: {notebook_path: ./src/tasks/03_convert.py}
+        - task_key: normalize
+          depends_on: [{task_key: convert}]
+          notebook_task: {notebook_path: ./src/tasks/04_normalize.py}
+        - task_key: validate
+          depends_on: [{task_key: normalize}]
+          notebook_task: {notebook_path: ./src/tasks/05_validate.py}
+        - task_key: repair
+          depends_on: [{task_key: validate}]
+          notebook_task: {notebook_path: ./src/tasks/06_repair.py}
+        - task_key: report
+          depends_on: [{task_key: repair}]
+          notebook_task: {notebook_path: ./src/tasks/07_report.py}
+
+  dashboards:
+    migration_monitor:
+      display_name: "[${bundle.target}] T-SQL Migration Monitor"
+      warehouse_id: ${var.warehouse_id}
+      file_path: ./dashboard/migration_monitor.lvdash.json

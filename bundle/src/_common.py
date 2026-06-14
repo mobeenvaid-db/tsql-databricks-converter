@@ -1,0 +1,438 @@
+# Databricks notebook source
+# MAGIC %md
+# MAGIC # tsql-migrator — shared library
+# MAGIC Config (from job parameters), prompts, and all stage helpers. Every task
+# MAGIC notebook does `%run ./_common` first, then runs its single stage. Nothing
+# MAGIC here is specific to any customer, catalog, or workspace — all behavior is
+# MAGIC driven by job parameters with neutral defaults.
+
+# COMMAND ----------
+import re, json, time, threading, hashlib
+from concurrent.futures import ThreadPoolExecutor
+from pyspark.sql import functions as F, types as T
+
+# ---- parameters (neutral defaults; override per org via job params) ----
+def _w(name, default=""):
+    dbutils.widgets.text(name, default)
+    return dbutils.widgets.get(name).strip()
+
+CATALOG    = _w("catalog", "main")                       # target Unity Catalog
+SCHEMA     = _w("schema", "tsql_migration")              # schema for all artifacts
+SOURCE_DIALECT = _w("source_dialect", "tsql")            # sqlglot read dialect
+RAW_SQL_PATH = _w("raw_sql_path", "")                    # UC Volume w/ SSMS export (ingest)
+WAREHOUSE_ID = _w("warehouse_id", "")                    # large multi-cluster SQL warehouse
+SCRATCH_PREFIX = _w("scratch_prefix", "_migrate_scratch__")
+MAX_BYTES  = int(_w("max_source_bytes", "180000"))
+CONV_PARTS = int(_w("convert_partitions", "48"))
+REPAIRS    = int(_w("repair_iterations", "2"))
+FRACTION   = float(_w("fraction", "1.0"))                # staged validation rollout
+SAMPLE     = int(_w("sample_limit", "0"))
+# code_catalog = the catalog literal that appears INSIDE converted code refs.
+# For a fresh end-to-end run this equals CATALOG. Only differs when validating
+# code that was generated against another catalog name (re-staged migrations).
+CODE_CATALOG = _w("code_catalog", "") or CATALOG
+# Catalog that hosts the isolated validation scratch schemas. Defaults to the
+# target catalog, but some catalogs (e.g. a restricted `users` catalog with a
+# schema quota) cannot host arbitrary schemas, so point this at a writable one.
+SCRATCH_CATALOG = _w("scratch_catalog", "") or CATALOG
+FQ = f"{CATALOG}.{SCHEMA}"
+
+# Model tiers: cheapest model that reliably handles each complexity class.
+ENDPOINTS = {
+    "trivial": _w("model_trivial", "databricks-claude-haiku-4-5"),
+    "simple":  _w("model_simple",  "databricks-claude-sonnet-4-6"),
+    "medium":  _w("model_medium",  "databricks-claude-sonnet-4-6"),
+    "complex": _w("model_complex", "databricks-claude-opus-4-8"),
+}
+REPAIR_ENDPOINT = {
+    "trivial": "databricks-claude-sonnet-4-6", "simple": "databricks-claude-sonnet-4-6",
+    "medium": "databricks-claude-opus-4-8", "complex": "databricks-claude-opus-4-8",
+}
+DEPLOY_ORDER = ["SCHEMA", "TABLE", "SYNONYM", "FUNCTION", "VIEW", "PROCEDURE"]
+
+spark.sql(f"CREATE SCHEMA IF NOT EXISTS {FQ}")
+spark.sql(f"USE CATALOG {CATALOG}")
+spark.sql(f"USE SCHEMA {SCHEMA}")
+print("config:", dict(catalog=CATALOG, schema=SCHEMA, dialect=SOURCE_DIALECT,
+                      warehouse=WAREHOUSE_ID or "(none)", fraction=FRACTION))
+
+# COMMAND ----------
+# MAGIC %md ## Conversion prompt library (T-SQL/ANSI -> Databricks)
+
+# COMMAND ----------
+RULEBOOK = r"""
+You convert source SQL (default Microsoft SQL Server T-SQL) into Databricks SQL
+for Unity Catalog. The source was exported by a DDL scripting tool. Convert it faithfully.
+
+OUTPUT CONTRACT (critical):
+- Output ONLY the converted code. No prose, no explanation, no markdown fences.
+- The VERY FIRST characters must be code (CREATE, SELECT, WITH, or `def`).
+- Preserve all business logic, column names, and ordering exactly.
+- Target Unity Catalog. Qualify objects as `{catalog}`.`{schema}`.`{object}` using
+  the ORIGINAL schema/object names (do not invent or rename).
+- If a construct has no Databricks equivalent, produce the closest faithful
+  equivalent and add ONE trailing `-- MIGRATION_NOTE:` line. Never drop logic silently.
+
+REMOVE source artifacts entirely: `USE [...]`, `GO`, `SET ANSI_NULLS/QUOTED_IDENTIFIER/NOCOUNT`,
+`ON [PRIMARY]`, `TEXTIMAGE_ON`, filegroup/storage option blocks, `WITH (PAD_INDEX=...)`,
+`NOT FOR REPLICATION`, `COLLATE ...`, `WITH NOCHECK`, `WITH SCHEMABINDING`. Drop standalone
+constraint/index DDL Delta does not support (keep inline `PRIMARY KEY (...) NOT ENFORCED` only).
+
+IDENTIFIERS: `[Name]` -> `Name`; names with spaces/special chars stay backtick-quoted and the
+table gets `delta.columnMapping.mode='name'`. Three-part `db.schema.obj` -> `{catalog}.schema.obj`.
+Do NOT emit a bare `NULL` nullability marker (columns are nullable by default); keep `NOT NULL`.
+
+DATA TYPES: NVARCHAR/VARCHAR/CHAR/NCHAR/TEXT/NTEXT/SYSNAME -> STRING; BIT -> BOOLEAN;
+TINYINT/SMALLINT/INT/BIGINT keep; DATETIME/DATETIME2/SMALLDATETIME/DATETIMEOFFSET -> TIMESTAMP;
+DATE keep; TIME -> STRING; MONEY/SMALLMONEY -> DECIMAL(19,4); DECIMAL/NUMERIC keep;
+FLOAT -> DOUBLE; REAL -> FLOAT; UNIQUEIDENTIFIER -> STRING; BINARY/VARBINARY/IMAGE/ROWVERSION -> BINARY;
+XML -> STRING. IDENTITY(s,i) -> the column MUST be `BIGINT GENERATED BY DEFAULT AS IDENTITY`.
+
+DELTA DDL: whenever ANY column has a DEFAULT, the CREATE TABLE MUST end with
+`USING DELTA TBLPROPERTIES ('delta.feature.allowColumnDefaults'='supported')`.
+
+FUNCTIONS/EXPRESSIONS: ISNULL->COALESCE; IIF->IF; GETDATE()/CURRENT_TIMESTAMP->current_timestamp();
+GETUTCDATE()/SYSUTCDATETIME()->to_utc_timestamp(current_timestamp(),current_timezone()); LEN->length;
+DATALENGTH->length; CHARINDEX(sub,str[,start])->locate(sub,str[,start]); string `+`->concat/`||`;
+CONVERT(t,x[,style])->CAST(x AS t) or to_date/date_format/to_timestamp; DATEADD/DATEDIFF/DATEPART->
+date_add/add_months/INTERVAL, datediff/months_between, date_part; FORMAT(d,'fmt')->date_format;
+TOP n->trailing LIMIT n (TOP PERCENT/WITH TIES->window); {d '...'}/{ts '...'}->DATE/TIMESTAMP literal;
+@@ROWCOUNT/@@IDENTITY/etc.->closest construct + MIGRATION_NOTE; STUFF(...FOR XML PATH(''))->
+array_join(collect_list(...),sep)/concat_ws; ISNUMERIC->RLIKE; NEWID()->uuid().
+""".strip()
+
+FORM_INSTRUCTIONS = {
+    "sql_ddl": """
+TASK: Convert this CREATE TABLE / CREATE SCHEMA / synonym DDL to Databricks SQL.
+- `CREATE SCHEMA IF NOT EXISTS {catalog}.{schema}` for schema scripts.
+- Tables: `CREATE TABLE IF NOT EXISTS {catalog}.{schema}.{object} ( ... ) USING DELTA;`
+  map types, keep NOT NULL, convert IDENTITY, drop indexes/filegroups/storage options.
+- SYNONYM: create a VIEW selecting from the synonym target + a MIGRATION_NOTE.
+- Output a single executable statement ending with `;`.""".strip(),
+    "sql_view": """
+TASK: Convert this CREATE VIEW to Databricks SQL.
+- `CREATE OR REPLACE VIEW {catalog}.{schema}.{object} AS <select>;`
+- Translate the SELECT body per the rulebook; keep aliases identical; resolve refs to
+  `{catalog}`.`<schema>`.`<name>`. Output one executable statement ending with `;`.""".strip(),
+    "sql_function": """
+TASK: Convert this user-defined function to a Databricks SQL UDF.
+- Scalar -> `CREATE OR REPLACE FUNCTION {catalog}.{schema}.{object}(...) RETURNS <type> RETURN <expr>;`
+- Inline TVF -> `... RETURNS TABLE ... RETURN (SELECT ...)`.
+- Procedural bodies: rewrite as a single expression via CASE/subqueries where possible, else
+  closest SQL UDF + MIGRATION_NOTE. Output one statement ending with `;`.""".strip(),
+    "sql_scripting": """
+TASK: Convert this stored procedure to a Databricks SQL stored procedure (SQL scripting).
+- `CREATE OR REPLACE PROCEDURE {catalog}.{schema}.{object}(<params>) LANGUAGE SQL
+  SQL SECURITY INVOKER AS BEGIN ... END;` (SQL SECURITY INVOKER is REQUIRED).
+- `@p type`->`p type` (OUTPUT->OUT); `SELECT @v=...`->`SET v=(SELECT ...)`; use DECLARE/SET/IF/WHILE/FOR.
+- `#temp`->TEMPORARY VIEW (read-only) or session table; keep DML targeting `{catalog}`.`schema`.`table`.
+- Output one CREATE PROCEDURE statement ending with `;`.
+
+DATABRICKS SQL-SCRIPTING RULES (these cause most failures — follow exactly):
+- DECLARE PLACEMENT: every `DECLARE` MUST appear at the very start of its `BEGIN ... END`
+  block, before ANY executable statement (TRUNCATE/SET/INSERT/IF/etc.). T-SQL allows DECLARE
+  anywhere; Databricks does not. HOIST all declarations to the top of the block.
+- STATEMENT TERMINATION: terminate EVERY statement inside the body with a semicolon `;`
+  (DECLARE, SET, INSERT, UPDATE, DELETE, MERGE, the last statement too). Balance every
+  BEGIN with an END. Compound IF/WHILE bodies use `THEN ... END IF;` / `DO ... END WHILE;`.
+- MERGE: T-SQL `MERGE target USING src ON ... WHEN MATCHED THEN UPDATE SET ...
+  WHEN NOT MATCHED THEN INSERT ...;` becomes Databricks `MERGE INTO target USING src ON ...
+  WHEN MATCHED THEN UPDATE SET ... WHEN NOT MATCHED THEN INSERT (...) VALUES (...);` —
+  note `MERGE INTO`, and the MERGE is its own terminated statement.
+- No `@@ROWCOUNT`/`@@ERROR`/`BEGIN TRAN`/`GOTO`/`RAISERROR` — replace with the closest
+  scripting construct (or drop transaction wrappers) and add a `-- MIGRATION_NOTE:`.""".strip(),
+    "pyspark": """
+TASK: Convert this procedural object to a PySpark function (source uses cursors, dynamic SQL,
+or temp-table loops that do not map to SQL scripting).
+- `def run(spark, params: dict = None):` returning a DataFrame or None.
+- Cursors -> set-based DataFrame logic (collected-row iteration only if genuinely sequential).
+- Dynamic SQL -> build string + `spark.sql(...)`. `#temp`->createOrReplaceTempView.
+- Read/write `{catalog}`.`schema`.`table`. Output ONLY valid Python.""".strip(),
+}
+
+def build_prompt(target_form, catalog, schema, obj, source_sql):
+    form = FORM_INSTRUCTIONS[target_form]
+    header = (RULEBOOK.replace("{catalog}", catalog) + "\n\n"
+              + form.replace("{catalog}", catalog).replace("{schema}", schema).replace("{object}", obj))
+    return (f"{header}\n\nTarget catalog: {catalog}\nOriginal schema: {schema}\n"
+            f"Original object: {obj}\n\nSOURCE SQL:\n```\n{source_sql}\n```\n\n"
+            f"Converted Databricks code (code only, no fences):")
+
+REPAIR_INSTRUCTION = (
+    "The Databricks code you previously produced FAILED to compile. Below is your previous "
+    "output and the exact Databricks engine error. Fix it so it compiles and runs on Databricks "
+    "SQL / Unity Catalog, preserving business logic. Apply the same rulebook. Output ONLY the "
+    "corrected code, no fences, no prose.")
+
+# COMMAND ----------
+# MAGIC %md ## Output cleaning + ingest classification
+
+# COMMAND ----------
+_CODE_START = re.compile(r"^\s*(--|#|/\*|\(|@|CREATE|SELECT|WITH|INSERT|UPDATE|DELETE|MERGE|ALTER|"
+                         r"DROP|USE|SET|DECLARE|BEGIN|VALUES|COMMENT|def |import |from |class )", re.I)
+def strip_fences(code):
+    if code is None: return None
+    c = re.sub(r"\n```\s*$", "", re.sub(r"^```[a-zA-Z]*\s*\n", "", code.strip())).strip()
+    for i, ln in enumerate(c.split("\n")):
+        if _CODE_START.match(ln): return "\n".join(c.split("\n")[i:]).strip()
+        if ln.strip() == "": continue
+    return c
+strip_fences_udf = F.udf(strip_fences, T.StringType())
+
+OBJECT_FOLDERS = ["SCHEMA", "SYNONYM", "TABLE", "FUNCTION", "VIEW", "PROCEDURE"]
+_SIG = {"has_cursor": r"\bDECLARE\b[^;]{0,120}\bCURSOR\b", "has_while": r"\bWHILE\b",
+        "has_temp_table": r"(#\w+)|\bINTO\s+#", "has_table_var": r"\bDECLARE\s+@\w+\s+TABLE\b",
+        "has_dynamic_sql": r"\b(EXEC\s*\(|sp_executesql)\b", "has_merge": r"\bMERGE\b\s+",
+        "has_try_catch": r"\bBEGIN\s+TRY\b", "has_transaction": r"\b(BEGIN\s+TRAN|COMMIT\s+TRAN|ROLLBACK)\b",
+        "has_pivot": r"\b(PIVOT|UNPIVOT)\b", "has_identity": r"\bIDENTITY\s*\(",
+        "has_output_param": r"@\w+\s+\w+(\s*\([^)]*\))?\s+(OUTPUT|OUT)\b", "has_cte": r"\bWITH\b[\s\S]{0,200}\bAS\s*\("}
+_SIG_C = {k: re.compile(v, re.I) for k, v in _SIG.items()}
+
+def _decode_sql(raw):
+    import codecs
+    if raw.startswith(codecs.BOM_UTF16_LE): return raw.decode("utf-16-le", "replace").lstrip("﻿")
+    if raw.startswith(codecs.BOM_UTF16_BE): return raw.decode("utf-16-be", "replace").lstrip("﻿")
+    if raw.startswith(codecs.BOM_UTF8): return raw.decode("utf-8-sig", "replace")
+    if raw[:200].count(b"\x00") > 20: return raw.decode("utf-16-le", "replace").lstrip("﻿")
+    try: return raw.decode("utf-8")
+    except Exception: return raw.decode("latin-1", "replace")
+
+def _classify(object_type, sql):
+    a = re.sub(r"'(?:[^']|'')*'", "''", re.sub(r"--[^\n]*", " ", re.sub(r"/\*[\s\S]*?\*/", " ", sql)))
+    sig = {k: bool(c.search(a)) for k, c in _SIG_C.items()}
+    loc = a.count("\n") + 1
+    pyspark_force = sig["has_cursor"] or sig["has_dynamic_sql"] or (sig["has_temp_table"] and sig["has_while"])
+    if object_type in ("TABLE", "SCHEMA", "SYNONYM"): tf = "sql_ddl"
+    elif object_type == "VIEW": tf = "sql_view"
+    elif object_type == "FUNCTION": tf = "pyspark" if pyspark_force else "sql_function"
+    else: tf = "pyspark" if pyspark_force else "sql_scripting"
+    score = (loc/200.0 + 2*sig["has_cursor"] + 2*sig["has_dynamic_sql"] + sig["has_while"]
+             + sig["has_temp_table"] + sig["has_merge"] + sig["has_try_catch"] + sig["has_pivot"] + sig["has_table_var"])
+    if object_type in ("TABLE", "SCHEMA", "SYNONYM"): tier = "trivial"
+    elif score >= 4 or loc > 600: tier = "complex"
+    elif score >= 1.5 or loc > 150: tier = "medium"
+    else: tier = "simple"
+    return sig, loc, tf, tier, round(score, 2)
+
+def _ingest_row(path, content):
+    parts = path.replace(":", "/").split("/")
+    folder = next((p for p in reversed(parts[:-1]) if p in OBJECT_FOLDERS), "TABLE")
+    fname = parts[-1]; stem = fname[:-4] if fname.lower().endswith(".sql") else fname
+    sp = stem.split("."); schema_name, object_name = (sp[0], ".".join(sp[1:])) if len(sp) >= 2 else ("dbo", stem)
+    sql = _decode_sql(content); sig, loc, tf, tier, score = _classify(folder, sql)
+    row = {"object_id": hashlib.sha1(f"{folder}/{fname}".encode()).hexdigest()[:16],
+           "object_type": folder, "schema_name": schema_name, "object_name": object_name,
+           "full_name": f"{schema_name}.{object_name}", "source_file": fname,
+           "source_bytes": len(content), "loc": loc, "target_form": tf,
+           "complexity_tier": tier, "complexity_score": score, "source_sql": sql}
+    row.update({f"sig_{k}": v for k, v in sig.items()})
+    return row
+
+_INGEST_SCHEMA = T.StructType(
+    [T.StructField("object_id", T.StringType()), T.StructField("object_type", T.StringType()),
+     T.StructField("schema_name", T.StringType()), T.StructField("object_name", T.StringType()),
+     T.StructField("full_name", T.StringType()), T.StructField("source_file", T.StringType()),
+     T.StructField("source_bytes", T.LongType()), T.StructField("loc", T.LongType()),
+     T.StructField("target_form", T.StringType()), T.StructField("complexity_tier", T.StringType()),
+     T.StructField("complexity_score", T.DoubleType()), T.StructField("source_sql", T.StringType())]
+    + [T.StructField(f"sig_{k}", T.BooleanType()) for k in _SIG])
+
+# COMMAND ----------
+# MAGIC %md ## sqlglot transpile (deterministic) + normalize (deterministic)
+
+# COMMAND ----------
+SQLGLOT_TYPES = {"TABLE", "VIEW", "SCHEMA"}
+def make_sqlglot_udf(catalog, dialect):
+    def _tx(object_type, source_sql):
+        if object_type not in SQLGLOT_TYPES or not source_sql:
+            return {"code": None, "err": "skipped"}
+        try:
+            import sqlglot
+            from sqlglot import exp
+            s = re.sub(r"(?im)^\s*GO\s*;?\s*$", "\n", source_sql)
+            s = re.sub(r"(?im)^\s*(USE\s+\[?\w+\]?|SET\s+(ANSI_NULLS|QUOTED_IDENTIFIER|NOCOUNT)\s+(ON|OFF))\s*;?\s*$", "", s)
+            outs = []
+            for e in sqlglot.parse(s, read=dialect):
+                if e is None: continue
+                for tbl in e.find_all(exp.Table):
+                    if tbl.db: tbl.set("catalog", exp.to_identifier(catalog))
+                outs.append(e.sql(dialect="databricks", pretty=True))
+            code = ";\n".join(x for x in outs if x and x.strip())
+            if not code:
+                return {"code": None, "err": "empty"}
+            # Sanity check: clean Databricks DDL has no T-SQL [identifier] brackets.
+            # If sqlglot emitted leftover brackets (partial transpile of types like
+            # [datetime2](7) etc.), treat it as a MISS so the object routes to the LLM
+            # fallback instead of being accepted as done. Ignore brackets inside comments.
+            body = re.sub(r"--[^\n]*", "", re.sub(r"/\*[\s\S]*?\*/", "", code))
+            if re.search(r"\[[A-Za-z]", body):
+                return {"code": None, "err": "tsql_bracket_leak"}
+            return {"code": code, "err": None}
+        except Exception as ex:
+            return {"code": None, "err": str(ex)[:300]}
+    return F.udf(_tx, T.StructType([T.StructField("code", T.StringType()), T.StructField("err", T.StringType())]))
+
+def run_ai_batch(src_table, out_table, endpoint, where, max_tokens=16000, nparts=64):
+    ai = (f"ai_query('{endpoint}', prompt, failOnError => false, "
+          f"modelParameters => named_struct('max_tokens', {max_tokens})) AS resp")
+    df = (spark.table(src_table).where(where).repartition(nparts)
+          .selectExpr("object_id", f"'{endpoint}' AS model_endpoint", ai))
+    df.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(out_table)
+    return spark.table(out_table).count()
+
+_re_identity = re.compile(r"\b(?:INT|INTEGER|SMALLINT|TINYINT|BIGINT)\b(\s+GENERATED\s+(?:ALWAYS|BY\s+DEFAULT)\s+AS\s+IDENTITY)", re.I)
+def _strip_bare_null(code):
+    code = re.sub(r"(?i)\bNOT\s+NULL\b", "\x01", code)
+    code = re.sub(r"(?i)\bDEFAULT\s+NULL\b", "\x02", code)
+    code = re.sub(r"(?i)\s+NULL\b(?=\s*[,)\n])", "", code)
+    return code.replace("\x01", "NOT NULL").replace("\x02", "DEFAULT NULL")
+def normalize_databricks_sql(code, object_type):
+    if not code: return code
+    if object_type == "TABLE":
+        code = re.sub(r",?\s*\bUNIQUE\s*\([^)]*\)(\s+NOT\s+ENFORCED)?", "", code, flags=re.I)
+        code = re.sub(r",(\s*\))", r"\1", code)
+        code = _re_identity.sub(r"BIGINT\1", code)
+        code = _strip_bare_null(code)
+        n_default = len(re.findall(r"\bDEFAULT\b", code, re.I)) - len(re.findall(r"\bBY\s+DEFAULT\b", code, re.I))
+        if n_default > 0 and "allowColumnDefaults" not in code:
+            if re.search(r"USING\s+DELTA", code, re.I):
+                code = re.sub(r"(USING\s+DELTA)\b", r"\1 TBLPROPERTIES ('delta.feature.allowColumnDefaults' = 'supported')", code, count=1, flags=re.I)
+            else:
+                code = re.sub(r";\s*$", "", code.rstrip()) + " TBLPROPERTIES ('delta.feature.allowColumnDefaults' = 'supported');"
+        # 6) columns with spaces/special chars need Delta column-mapping mode
+        if re.search(r"`[^`]*[ ,;{}()=\t][^`]*`", code) and "columnMapping" not in code:
+            props = ("'delta.columnMapping.mode'='name','delta.minReaderVersion'='2',"
+                     "'delta.minWriterVersion'='5'")
+            if re.search(r"TBLPROPERTIES\s*\(", code, re.I):
+                code = re.sub(r"(TBLPROPERTIES\s*\()", r"\1" + props + ",", code, count=1, flags=re.I)
+            elif re.search(r"USING\s+DELTA", code, re.I):
+                code = re.sub(r"(USING\s+DELTA)\b", r"\1 TBLPROPERTIES (" + props + ")", code, count=1, flags=re.I)
+            else:
+                code = re.sub(r";\s*$", "", code.rstrip()) + " TBLPROPERTIES (" + props + ");"
+    elif object_type == "SCHEMA":
+        code = re.sub(r"(?i)\bCREATE\s+SCHEMA\s+(?!IF\s+NOT\s+EXISTS)", "CREATE SCHEMA IF NOT EXISTS ", code)
+    elif object_type == "PROCEDURE":
+        if not re.search(r"SQL\s+SECURITY", code, re.I):
+            if re.search(r"LANGUAGE\s+SQL", code, re.I):
+                code = re.sub(r"(LANGUAGE\s+SQL)\b", r"\1 SQL SECURITY INVOKER", code, count=1, flags=re.I)
+            else:
+                code = re.sub(r"\bBEGIN\b", "SQL SECURITY INVOKER\nBEGIN", code, count=1, flags=re.I)
+    return code
+
+# COMMAND ----------
+# MAGIC %md ## Validation engine (SQL Statement Execution API fan-out, in-workspace)
+
+# COMMAND ----------
+_ctx = dbutils.notebook.entry_point.getDbutils().notebook().getContext()
+_HOST = "https://" + spark.conf.get("spark.databricks.workspaceUrl")
+import requests
+from requests.adapters import HTTPAdapter
+_TOK = _ctx.apiToken().get()
+_H = {"Authorization": f"Bearer {_TOK}", "Content-Type": "application/json"}
+TERMINAL = ("SUCCEEDED", "FAILED", "CANCELED", "CLOSED")
+_tls = threading.local()
+def _sess():
+    s = getattr(_tls, "s", None)
+    if s is None:
+        s = requests.Session(); s.mount("https://", HTTPAdapter(pool_connections=6, pool_maxsize=6, max_retries=3)); _tls.s = s
+    return s
+def wh_submit(stmt):
+    try:
+        r = _sess().post(f"{_HOST}/api/2.0/sql/statements", headers=_H, timeout=30, json={
+            "warehouse_id": WAREHOUSE_ID, "catalog": CATALOG, "statement": stmt,
+            "wait_timeout": "0s", "disposition": "INLINE", "format": "JSON_ARRAY"}).json()
+        return r.get("statement_id"), r.get("status", {}).get("state"), r
+    except Exception as e:
+        return None, "SUBMIT_ERR", {"err": str(e)[:200]}
+def wh_poll(sid):
+    try:
+        r = _sess().get(f"{_HOST}/api/2.0/sql/statements/{sid}", headers=_H, timeout=30).json()
+        return r.get("status", {}).get("state"), r
+    except Exception:
+        return "RUNNING", None
+def wh_err(r): return ((r or {}).get("status", {}).get("error", {}) or {}).get("message", "")[:1500]
+def wh_fetch(stmt, cap=120):
+    sid, st, r = wh_submit(stmt); t0 = time.time()
+    while st not in TERMINAL:
+        if not sid or time.time() - t0 > cap: return []
+        time.sleep(0.4); st, r = wh_poll(sid)
+    return r.get("result", {}).get("data_array", []) if st == "SUCCEEDED" else []
+
+def rewrite_to_scratch(code):
+    if not code: return None
+    src = re.escape(CODE_CATALOG)
+    return re.sub(rf"`?{src}`?\s*\.\s*`?(?P<s>[A-Za-z0-9_ ]+?)`?\s*\.",
+                  lambda m: f"{SCRATCH_CATALOG}.`{SCRATCH_PREFIX}{m.group('s').strip()}`.", code)
+def as_single(code):
+    c = (code or "").rstrip()
+    for _ in range(200):
+        if c.endswith(";"): c = c[:-1].rstrip(); continue
+        if c.endswith("*/"):
+            i = c.rfind("/*")
+            if i != -1: c = c[:i].rstrip(); continue
+        m = re.search(r"(?:^|\n)[ \t]*--[^\n]*$", c)
+        if m: c = c[:m.start()].rstrip(); continue
+        break
+    return c
+_VB = re.compile(r"(?is)\bCREATE\s+(?:OR\s+REPLACE\s+)?VIEW\s+.+?\sAS\s+(?P<b>.*)$")
+def view_to_explain(code):
+    m = _VB.search(code or "")
+    return ("EXPLAIN " + as_single(m.group("b"))) if m else None
+def extract_main(otype, code):
+    if not code: return code
+    m = re.compile(rf"(?is)\bCREATE\s+(?:OR\s+REPLACE\s+)?(?:IF\s+NOT\s+EXISTS\s+)?{otype}\b").search(code)
+    return code[m.start():] if m else code
+_TBL_HEAD = re.compile(r"(?is)^\s*CREATE\s+(?:OR\s+REPLACE\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?")
+def norm_table(code): return _TBL_HEAD.sub("CREATE TABLE IF NOT EXISTS ", code, count=1)
+def force_replace_view(code):
+    return re.sub(r"(?i)\bCREATE\s+(?:OR\s+REPLACE\s+)?VIEW\s+", "CREATE OR REPLACE VIEW ", code, count=1)
+_MISS = re.compile(rf"{re.escape(SCRATCH_PREFIX)}[A-Za-z0-9_]+`?\s*\.\s*`?([A-Za-z0-9_]+)")
+_HAS_SQL_CREATE = re.compile(r"(?is)\bCREATE\s+(?:OR\s+REPLACE\s+)?(?:IF\s+NOT\s+EXISTS\s+)?(?:PROCEDURE|FUNCTION)\b")
+def is_python(code): return not _HAS_SQL_CREATE.search(code or "")
+def classify(state, err, names):
+    if state == "SUCCEEDED": return "pass"
+    if state in ("CANCELED", "CLOSED", "SUBMIT_ERR"): return "fail"
+    if err and any(k in err for k in ("TABLE_OR_VIEW_NOT_FOUND", "ROUTINE_NOT_FOUND", "UNRESOLVED_ROUTINE")):
+        m = _MISS.search(err)
+        if m: return "unresolved_ext_dep" if m.group(1).lower() not in names else "sound_dep"
+    return "fail"
+def build_stmt(otype, code):
+    code = rewrite_to_scratch(extract_main(otype, code))
+    if otype == "VIEW": return view_to_explain(code) or as_single(force_replace_view(code))
+    if otype == "TABLE": return as_single(norm_table(code))
+    s = force_replace_view(code)
+    return as_single(s) if otype != "PROCEDURE" else s
+def validate_batch(otype, rows, names, sub_workers=24, poll_workers=24, max_inflight=800, cap=180):
+    stmts = [(r[0], build_stmt(otype, r[3])) for r in rows]
+    results = {}; i = 0; inflight = {}; t0 = time.time()
+    def do_submit(it):
+        oid, s = it; sid, st, r = wh_submit(s); return oid, sid, st, r
+    while i < len(stmts) or inflight:
+        while i < len(stmts) and len(inflight) < max_inflight:
+            batch = stmts[i:i+150]; i += len(batch)
+            with ThreadPoolExecutor(sub_workers) as ex:
+                for oid, sid, st, r in ex.map(do_submit, batch):
+                    if st in TERMINAL: results[oid] = (classify(st, wh_err(r), names), wh_err(r))
+                    elif sid: inflight[oid] = (sid, time.time())
+                    else: results[oid] = ("fail", "no statement_id")
+        if not inflight: continue
+        time.sleep(2)
+        def do_poll(it):
+            oid, (sid, ts) = it; st, r = wh_poll(sid); return oid, sid, ts, st, r
+        with ThreadPoolExecutor(poll_workers) as ex:
+            for oid, sid, ts, st, r in ex.map(do_poll, list(inflight.items())):
+                if st in TERMINAL: results[oid] = (classify(st, wh_err(r), names), wh_err(r)); inflight.pop(oid, None)
+                elif time.time() - ts > cap:
+                    try: _sess().post(f"{_HOST}/api/2.0/sql/statements/{sid}/cancel", headers=_H, timeout=10)
+                    except Exception: pass
+                    results[oid] = ("timeout", "cap"); inflight.pop(oid, None)
+        print(f"  {otype}: {len(results)}/{len(rows)} done, {len(inflight)} in-flight ({time.time()-t0:.0f}s)")
+    return results
+def validate_python(rows):
+    res = {}
+    for r in rows:
+        try: compile(r[3] or "", "<o>", "exec"); res[r[0]] = ("pass", "")
+        except SyntaxError as e: res[r[0]] = ("fail", f"PYTHON_SYNTAX: {e}"[:300])
+    return res
+
+print("common library loaded")

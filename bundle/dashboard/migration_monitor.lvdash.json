@@ -1,0 +1,572 @@
+{
+  "datasets": [
+    {
+      "name": "kpi",
+      "displayName": "KPIs",
+      "queryLines": [
+        "\n        SELECT count(*) total,\n               sum(CASE WHEN valid_status IN ('pass','unresolved_ext_dep','sound_dep') THEN 1 ELSE 0 END) success,\n               round(100.0*sum(CASE WHEN valid_status IN ('pass','unresolved_ext_dep','sound_dep') THEN 1 ELSE 0 END)/count(*),1) pct_success,\n               sum(CASE WHEN valid_status IN ('fail','timeout') THEN 1 ELSE 0 END) needs_review\n        FROM (SELECT * FROM main.tsql_migration.validation_results WHERE run_ts=(SELECT max(run_ts) FROM main.tsql_migration.validation_results WHERE fraction=(SELECT max(fraction) FROM main.tsql_migration.validation_results))) v"
+      ]
+    },
+    {
+      "name": "funnel",
+      "displayName": "Reconciliation funnel",
+      "queryLines": [
+        "SELECT object_type, source_n, converted_n, validated_n, success_n FROM main.tsql_migration.recon_inventory ORDER BY object_type"
+      ]
+    },
+    {
+      "name": "bytype",
+      "displayName": "Status by type",
+      "queryLines": [
+        "\n        SELECT object_type, CASE WHEN valid_status='pass' THEN '1 pass'\n               WHEN valid_status IN ('unresolved_ext_dep','sound_dep') THEN '2 sound (dep)'\n               WHEN valid_status='timeout' THEN '3 timeout' ELSE '4 fail' END status, count(*) n\n        FROM (SELECT * FROM main.tsql_migration.validation_results WHERE run_ts=(SELECT max(run_ts) FROM main.tsql_migration.validation_results WHERE fraction=(SELECT max(fraction) FROM main.tsql_migration.validation_results))) v GROUP BY 1,2 ORDER BY 1,2"
+      ]
+    },
+    {
+      "name": "rollout",
+      "displayName": "Staged rollout",
+      "queryLines": [
+        "\n        SELECT cast(fraction as string) fraction, round(100.0*sum(success)/sum(n),1) pct_success, sum(n) n\n        FROM main.tsql_migration.run_summary GROUP BY fraction ORDER BY fraction"
+      ]
+    },
+    {
+      "name": "errclass",
+      "displayName": "Failure classes",
+      "queryLines": [
+        "\n        SELECT CASE WHEN valid_error LIKE '%PARSE_SYNTAX_ERROR%' THEN 'parse syntax'\n                    WHEN valid_error LIKE '%PYTHON_SYNTAX%' THEN 'python syntax'\n                    WHEN valid_error LIKE '%UNRESOLVED_COLUMN%' THEN 'unresolved column'\n                    WHEN valid_error LIKE '%IDENTIFIER_TOO_MANY_NAME_PARTS%' THEN 'cross-db 3-part name'\n                    WHEN valid_error LIKE '%UNRESOLVABLE_TABLE_VALUED_FUNCTION%' THEN 'TVF unresolved'\n                    WHEN valid_status='timeout' THEN 'timeout (transient)' ELSE 'other' END errclass, count(*) n\n        FROM (SELECT * FROM main.tsql_migration.validation_results WHERE run_ts=(SELECT max(run_ts) FROM main.tsql_migration.validation_results WHERE fraction=(SELECT max(fraction) FROM main.tsql_migration.validation_results))) v WHERE valid_status IN ('fail','timeout') GROUP BY 1"
+      ]
+    },
+    {
+      "name": "review",
+      "displayName": "Needs review",
+      "queryLines": [
+        "\n        SELECT object_type, full_name, substr(regexp_replace(valid_error,'[\\n]',' '),1,220) error\n        FROM (SELECT * FROM main.tsql_migration.validation_results WHERE run_ts=(SELECT max(run_ts) FROM main.tsql_migration.validation_results WHERE fraction=(SELECT max(fraction) FROM main.tsql_migration.validation_results))) v WHERE valid_status IN ('fail','timeout') ORDER BY object_type, full_name"
+      ]
+    }
+  ],
+  "pages": [
+    {
+      "name": "57ff5a20",
+      "displayName": "Overview",
+      "pageType": "PAGE_TYPE_CANVAS",
+      "layout": []
+    },
+    {
+      "name": "03d7302a",
+      "displayName": "Migration Overview",
+      "pageType": "PAGE_TYPE_CANVAS",
+      "layout": [
+        {
+          "widget": {
+            "name": "d5ca95db",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "kpi",
+                  "fields": [
+                    {
+                      "name": "sum(total)",
+                      "expression": "SUM(`total`)"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "sum(total)",
+                  "displayName": "Objects validated"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Objects validated"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 0,
+            "width": 1,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "6195ff04",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "kpi",
+                  "fields": [
+                    {
+                      "name": "sum(success)",
+                      "expression": "SUM(`success`)"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "sum(success)",
+                  "displayName": "Successful"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Successful"
+              }
+            }
+          },
+          "position": {
+            "x": 1,
+            "y": 0,
+            "width": 1,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "e79cf8bb",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "kpi",
+                  "fields": [
+                    {
+                      "name": "sum(pct_success)",
+                      "expression": "SUM(`pct_success`)"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "sum(pct_success)",
+                  "displayName": "Success %"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Success %"
+              }
+            }
+          },
+          "position": {
+            "x": 2,
+            "y": 0,
+            "width": 1,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "3280adc9",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "kpi",
+                  "fields": [
+                    {
+                      "name": "sum(needs_review)",
+                      "expression": "SUM(`needs_review`)"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "sum(needs_review)",
+                  "displayName": "Needs review"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Needs review"
+              }
+            }
+          },
+          "position": {
+            "x": 3,
+            "y": 0,
+            "width": 1,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "5218c46b",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "bytype",
+                  "fields": [
+                    {
+                      "name": "object_type",
+                      "expression": "`object_type`"
+                    },
+                    {
+                      "name": "sum(n)",
+                      "expression": "SUM(`n`)"
+                    },
+                    {
+                      "name": "status",
+                      "expression": "`status`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "bar",
+              "encodings": {
+                "x": {
+                  "fieldName": "object_type",
+                  "scale": {
+                    "type": "categorical"
+                  },
+                  "displayName": "object_type"
+                },
+                "y": {
+                  "fieldName": "sum(n)",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "displayName": "SUM of n"
+                },
+                "label": {
+                  "show": true
+                },
+                "color": {
+                  "fieldName": "status",
+                  "scale": {
+                    "type": "categorical"
+                  },
+                  "displayName": "status"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Status by object type"
+              },
+              "mark": {
+                "colors": [
+                  "#00A972",
+                  "#8BCAE7",
+                  "#FFAB00",
+                  "#FF3621"
+                ]
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 3,
+            "width": 4,
+            "height": 7
+          }
+        },
+        {
+          "widget": {
+            "name": "908124ec",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "rollout",
+                  "fields": [
+                    {
+                      "name": "fraction",
+                      "expression": "`fraction`"
+                    },
+                    {
+                      "name": "sum(pct_success)",
+                      "expression": "SUM(`pct_success`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "bar",
+              "encodings": {
+                "x": {
+                  "fieldName": "fraction",
+                  "scale": {
+                    "type": "categorical"
+                  },
+                  "displayName": "fraction"
+                },
+                "y": {
+                  "fieldName": "sum(pct_success)",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "displayName": "SUM of pct_success"
+                },
+                "label": {
+                  "show": true
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Staged rollout \u2014 success % by fraction"
+              },
+              "mark": {
+                "colors": [
+                  "#00A972"
+                ]
+              }
+            }
+          },
+          "position": {
+            "x": 4,
+            "y": 0,
+            "width": 2,
+            "height": 5
+          }
+        },
+        {
+          "widget": {
+            "name": "e310c701",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "funnel",
+                  "fields": [
+                    {
+                      "name": "object_type",
+                      "expression": "`object_type`"
+                    },
+                    {
+                      "name": "sum(source_n)",
+                      "expression": "SUM(`source_n`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "bar",
+              "encodings": {
+                "x": {
+                  "fieldName": "object_type",
+                  "scale": {
+                    "type": "categorical"
+                  },
+                  "displayName": "object_type"
+                },
+                "y": {
+                  "fieldName": "sum(source_n)",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "displayName": "SUM of source_n"
+                },
+                "label": {
+                  "show": true
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Source object inventory"
+              },
+              "mark": {
+                "colors": [
+                  "#8BCAE7"
+                ]
+              }
+            }
+          },
+          "position": {
+            "x": 4,
+            "y": 5,
+            "width": 2,
+            "height": 5
+          }
+        }
+      ]
+    },
+    {
+      "name": "0eb3e377",
+      "displayName": "Quality & Failures",
+      "pageType": "PAGE_TYPE_CANVAS",
+      "layout": [
+        {
+          "widget": {
+            "name": "8dbf6f88",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "errclass",
+                  "fields": [
+                    {
+                      "name": "errclass",
+                      "expression": "`errclass`"
+                    },
+                    {
+                      "name": "sum(n)",
+                      "expression": "SUM(`n`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "bar",
+              "encodings": {
+                "x": {
+                  "fieldName": "errclass",
+                  "scale": {
+                    "type": "categorical",
+                    "sort": {
+                      "by": "y-reversed"
+                    }
+                  },
+                  "displayName": "errclass"
+                },
+                "y": {
+                  "fieldName": "sum(n)",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "displayName": "SUM of n"
+                },
+                "label": {
+                  "show": true
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Failure classes"
+              },
+              "mark": {
+                "colors": [
+                  "#FF3621"
+                ]
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 0,
+            "width": 3,
+            "height": 7
+          }
+        },
+        {
+          "widget": {
+            "name": "ac42ff82",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "review",
+                  "fields": [
+                    {
+                      "name": "object_type",
+                      "expression": "`object_type`"
+                    },
+                    {
+                      "name": "full_name",
+                      "expression": "`full_name`"
+                    },
+                    {
+                      "name": "error",
+                      "expression": "`error`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 1,
+              "widgetType": "table",
+              "encodings": {
+                "columns": [
+                  {
+                    "fieldName": "object_type",
+                    "type": "string",
+                    "displayAs": "string",
+                    "title": "Type",
+                    "displayName": "Type",
+                    "order": 100000,
+                    "alignContent": "left"
+                  },
+                  {
+                    "fieldName": "full_name",
+                    "type": "string",
+                    "displayAs": "string",
+                    "title": "Object",
+                    "displayName": "Object",
+                    "order": 100001,
+                    "alignContent": "left"
+                  },
+                  {
+                    "fieldName": "error",
+                    "type": "string",
+                    "displayAs": "string",
+                    "title": "Error",
+                    "displayName": "Error",
+                    "order": 100002,
+                    "alignContent": "left"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Objects needing review"
+              }
+            }
+          },
+          "position": {
+            "x": 3,
+            "y": 0,
+            "width": 3,
+            "height": 7
+          }
+        }
+      ]
+    }
+  ],
+  "uiSettings": {
+    "theme": {
+      "widgetHeaderAlignment": "ALIGNMENT_UNSPECIFIED"
+    },
+    "applyModeEnabled": false
+  }
+}
