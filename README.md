@@ -58,6 +58,7 @@ Tasks are independent and idempotent. Re-run only `validate`+`repair` after tuni
 | `fraction` | `1.0` | Fraction of objects to validate (staged rollout) |
 | `repair_iterations` | `2` | Error-driven repair passes |
 | `scratch_prefix` | `_migrate_scratch__` | Prefix for the isolated validation scratch schemas |
+| `scratch_catalog` | = `catalog` | Catalog that hosts the validation scratch schemas. Set this if the target catalog cannot create schemas (for example a restricted `users` catalog) |
 | `code_catalog` | = `catalog` | Only set differently when validating code generated against another catalog name |
 | `model_trivial/simple/medium/complex` | Haiku/Sonnet/Sonnet/Opus | Per-tier model endpoints |
 

@@ -17,6 +17,7 @@ variables:
   schema:         {description: Schema for all migration artifacts, default: tsql_migration}
   warehouse_id:   {description: Large multi-cluster SQL warehouse for validation fan-out, default: ""}
   raw_sql_path:   {description: UC Volume holding the DDL-scripting export, default: ""}
+  scratch_catalog: {description: "Catalog for isolated validation scratch schemas. Set this if the target catalog cannot create schemas (e.g. a restricted users catalog). Defaults to catalog.", default: ""}
   source_dialect: {description: sqlglot source dialect, default: tsql}
   fraction:       {description: Fraction of objects to validate (staged rollout), default: "1.0"}
   repair_iterations: {default: "2"}
@@ -50,6 +51,7 @@ resources:
         - {name: schema,         default: "${var.schema}"}
         - {name: warehouse_id,   default: "${var.warehouse_id}"}
         - {name: raw_sql_path,   default: "${var.raw_sql_path}"}
+        - {name: scratch_catalog, default: "${var.scratch_catalog}"}
         - {name: source_dialect, default: "${var.source_dialect}"}
         - {name: fraction,       default: "${var.fraction}"}
         - {name: repair_iterations, default: "${var.repair_iterations}"}
