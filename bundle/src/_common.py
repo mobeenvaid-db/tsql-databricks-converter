@@ -99,6 +99,15 @@ date_add/add_months/INTERVAL, datediff/months_between, date_part; FORMAT(d,'fmt'
 TOP n->trailing LIMIT n (TOP PERCENT/WITH TIES->window); {d '...'}/{ts '...'}->DATE/TIMESTAMP literal;
 @@ROWCOUNT/@@IDENTITY/etc.->closest construct + MIGRATION_NOTE; STUFF(...FOR XML PATH(''))->
 array_join(collect_list(...),sep)/concat_ws; ISNUMERIC->RLIKE; NEWID()->uuid().
+
+PIVOT (differs from T-SQL — these mistakes are parse errors in Databricks):
+- Databricks form: `SELECT ... FROM (<subquery>) PIVOT (<agg> FOR <col> IN (v1 AS `v1`, v2 AS `v2`, ...))`.
+- The IN list takes LITERAL values, not bracketed identifiers: T-SQL `IN ([1],[5])` -> `IN (1 AS `1`, 5 AS `5`)`.
+- There is NO `AS <alias>` after the `)` that closes the PIVOT clause — drop the T-SQL pivot-table alias.
+- If the source SELECT re-aggregates the pivoted columns (outer MIN()/SUM() + GROUP BY/HAVING over
+  the `[value]` columns), Databricks cannot do that at the same level: wrap the whole PIVOT in a
+  subquery and put the outer aggregation/GROUP BY/HAVING around it. Restrict the inner subquery to
+  only the grouping key, the FOR column, and the aggregated column so grouping matches the T-SQL.
 """.strip()
 
 FORM_INSTRUCTIONS = {
@@ -363,6 +372,32 @@ def rewrite_to_scratch(code):
     src = re.escape(CODE_CATALOG)
     return re.sub(rf"`?{src}`?\s*\.\s*`?(?P<s>[A-Za-z0-9_ ]+?)`?\s*\.",
                   lambda m: f"{SCRATCH_CATALOG}.`{SCRATCH_PREFIX}{m.group('s').strip()}`.", code)
+
+# Inverse of the scratch rewrite: delete any scratch prefix(es) wherever they appear,
+# in code OR in an engine error string. rewrite_to_scratch is for ISOLATED VALIDATION
+# only and must never be persisted or shown to a model — when the validation error
+# (which carries scratch schema names) is fed back into the repair prompt, the model
+# bakes those names into its "fix"; persisting that and re-validating prefixes a SECOND
+# time (`_migrate_scratch___migrate_scratch__schema` -> SCHEMA_NOT_FOUND). Stripping the
+# prefix on both the repair INPUT (prior code + error) and OUTPUT closes that loop.
+# Collapsing repeats also self-heals any already-double-prefixed code from older runs.
+_SCRATCH_STRIP = re.compile(rf"(?:{re.escape(SCRATCH_PREFIX)})+")
+def strip_scratch(text):
+    return _SCRATCH_STRIP.sub("", text) if text else text
+
+# Heuristic completeness check: a finished converted object ends with `;` or `END`
+# (ignoring trailing -- MIGRATION_NOTE lines). Anything else means the model hit its
+# max_tokens mid-statement. Used to refuse persisting a truncated repair over a good
+# prior conversion.
+def looks_truncated(code):
+    if not code or not code.strip(): return True
+    c = code.rstrip()
+    while True:
+        m = re.search(r"(?:\A|\n)[ \t]*--[^\n]*\Z", c)
+        if not m: break
+        c = c[:m.start()].rstrip()
+    if not c: return True
+    return not (c.endswith(";") or re.search(r"\bEND\b\s*\Z", c, re.I))
 def as_single(code):
     c = (code or "").rstrip()
     for _ in range(200):

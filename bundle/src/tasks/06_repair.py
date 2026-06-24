@@ -32,10 +32,18 @@ def method_directive(otype, code):
     return "This object is a Databricks SQL CREATE FUNCTION (LANGUAGE SQL). KEEP it SQL; return ONE `CREATE FUNCTION` statement."
 
 def ask(model, otype, code, error):
+    # Strip scratch-validation schema names from BOTH the prior code and the engine error
+    # before they reach the model. The error is produced against isolated scratch schemas
+    # (`_migrate_scratch__<schema>`); if the model sees those names it copies them into the
+    # fix, which then gets prefixed a second time at re-validation and fails as
+    # SCHEMA_NOT_FOUND. The model must only ever see real `{catalog}.{schema}` names.
+    code, error = strip_scratch(code), strip_scratch(error)
     usr = (f"Object type: {otype}\nMETHOD CONSTRAINT: {method_directive(otype, code)}\n\n"
            f"--- EXACT DATABRICKS ERROR ---\n{error}\n\n--- PRIOR OUTPUT ---\n{code}")
+    # Sized to fully regenerate large procedures; an undersized cap truncates the fix
+    # mid-statement and the guard below then refuses to persist it.
     body = {"messages": [{"role": "system", "content": RULEBOOK + "\n\n" + REPAIR_INSTRUCTION},
-                         {"role": "user", "content": usr}], "max_tokens": 8000}
+                         {"role": "user", "content": usr}], "max_tokens": 32000}
     try:
         r = requests.post(f"{_HOST}/serving-endpoints/{model}/invocations", headers=_H, timeout=180, json=body).json()
         return r["choices"][0]["message"]["content"].strip()
@@ -66,8 +74,11 @@ for it in range(REPAIRS):
     tier_model = REPAIR_ENDPOINT["complex" if it > 0 else "medium"]
     def repair(row):
         oid, otype, fn, code, err = row
-        fixed = strip_fences(ask(tier_model, otype, code, err or ""))
-        if not fixed: return oid, None, None, None
+        # strip_scratch again on the model OUTPUT: belt-and-suspenders in case the model
+        # still emitted a scratch name. looks_truncated guards against persisting a fix
+        # that hit max_tokens mid-statement, which would overwrite a good prior conversion.
+        fixed = strip_scratch(strip_fences(ask(tier_model, otype, code, err or "")))
+        if not fixed or looks_truncated(fixed): return oid, None, None, None
         st, e = revalidate(otype, fixed); return oid, fixed, st, e
     fixed_ct = 0; updates = []
     with ThreadPoolExecutor(10) as ex:
