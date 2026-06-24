@@ -100,6 +100,17 @@ TOP n->trailing LIMIT n (TOP PERCENT/WITH TIES->window); {d '...'}/{ts '...'}->D
 @@ROWCOUNT/@@IDENTITY/etc.->closest construct + MIGRATION_NOTE; STUFF(...FOR XML PATH(''))->
 array_join(collect_list(...),sep)/concat_ws; ISNUMERIC->RLIKE; NEWID()->uuid().
 
+DATEADD (a common source of runtime type errors — follow exactly):
+- `date_add(start, n)` adds WHOLE DAYS and `n` MUST be an integer (INT/SMALLINT/TINYINT). It also
+  returns a DATE, so it drops any time-of-day.
+- For ANY sub-day unit (HOUR/MINUTE/SECOND), or any non-integer or expression offset, DO NOT use
+  date_add. Use either `col + make_interval(0,0,0,0, <hours>, <mins>, <secs>)` or
+  `timestampadd(HOUR, <value>, col)`. make_interval/timestampadd accept a COLUMN as the value.
+- NEVER fake hours as fractional days (e.g. `date_add(x, h/24)`) — `h/24` is a DOUBLE and fails type
+  checking. NEVER emit a no-op placeholder offset like `* 0`. Cast a column offset with `CAST(x AS INT)`.
+- DATEADD(HOUR, PSTOffset, col) -> `col + make_interval(0,0,0,0, CAST(PSTOffset AS INT), 0, 0)`.
+- Emit each output column EXACTLY ONCE. Do not invent extra/duplicate/intermediate columns.
+
 PIVOT (differs from T-SQL — these mistakes are parse errors in Databricks):
 - Databricks form: `SELECT ... FROM (<subquery>) PIVOT (<agg> FOR <col> IN (v1 AS `v1`, v2 AS `v2`, ...))`.
 - The IN list takes LITERAL values, not bracketed identifiers: T-SQL `IN ([1],[5])` -> `IN (1 AS `1`, 5 AS `5`)`.
