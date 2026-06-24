@@ -67,6 +67,30 @@ spark.sql(f"""
   WHERE v.run_ts='{run_ts}' AND v.valid_status IN ('fail','timeout')""")
 print(f"manual_review queue: {spark.table(f'{FQ}.manual_review').count()} objects")
 
+# temporal (system-versioned) tables: surfaced as their own bucket so the SCD2
+# conversion is reviewed explicitly rather than passing as an ordinary table.
+if "sig_has_temporal" in spark.table(f"{FQ}.source_objects").columns:
+    spark.sql(f"""
+      CREATE OR REPLACE TABLE {FQ}.temporal_tables AS
+      WITH tt AS (SELECT full_name, schema_name, object_name FROM {FQ}.source_objects
+                  WHERE object_type='TABLE' AND sig_has_temporal = true)
+      SELECT tt.full_name AS source_table,
+             tbl.method AS scd2_method,
+             vt.valid_status AS scd2_table_status,
+             vp.valid_status AS scd2_apply_proc_status,
+             concat(tt.object_name, '_scd2_apply') AS apply_procedure
+      FROM tt
+      LEFT JOIN {FQ}.converted_objects tbl
+        ON tbl.object_type='TABLE' AND lower(tbl.full_name)=lower(tt.full_name)
+      LEFT JOIN {FQ}.validation_results vt
+        ON vt.run_ts='{run_ts}' AND lower(vt.full_name)=lower(tt.full_name) AND vt.object_type='TABLE'
+      LEFT JOIN {FQ}.validation_results vp
+        ON vp.run_ts='{run_ts}' AND lower(vp.full_name)=lower(concat(tt.schema_name,'.',tt.object_name,'_scd2_apply'))
+      ORDER BY 1""")
+    nt = spark.table(f"{FQ}.temporal_tables").count()
+    print(f"temporal_tables (SCD2): {nt} tables")
+    if nt: spark.sql(f"SELECT * FROM {FQ}.temporal_tables").show(truncate=False)
+
 print("=== run_summary ===")
 spark.sql(f"SELECT * FROM {FQ}.run_summary WHERE run_ts='{run_ts}' ORDER BY object_type").show(truncate=False)
 print("=== recon_inventory ===")

@@ -14,7 +14,7 @@ A 7-task DAG, each task a focused notebook that shares one library (`src/_common
 | `ingest` | Decode the SSMS "Generate Scripts" export from a UC Volume (handles UTF-16), classify each object (target form + complexity tier), build per-object prompts | deterministic |
 | `transpile` | Transpile the mechanical bulk (tables, views, schemas) to the Databricks dialect | **sqlglot** (free, instant) |
 | `convert` | Convert what sqlglot cannot (procedures, procedural functions, parse failures), routed by complexity to the cheapest capable model | **tiered LLM** (`ai_query`: Haiku → Sonnet → Opus) |
-| `normalize` | Deterministic Delta-compatibility fixes (IDENTITY→BIGINT, column-DEFAULT table feature, bare-NULL strip, UNIQUE strip, SQL SECURITY INVOKER) | deterministic |
+| `normalize` | Deterministic Delta-compatibility fixes (IDENTITY→BIGINT, column-DEFAULT table feature, bare-NULL strip, UNIQUE strip, SQL SECURITY INVOKER) **+ system-versioned temporal tables → SCD Type 2** (see below) | deterministic |
 | `validate` | Deploy into isolated scratch schemas and binding-validate: tables (CREATE), views (EXPLAIN), functions/procedures (CREATE), PySpark objects (compile). Fans out to a large multi-cluster SQL warehouse. `fraction` enables a staged rollout | deterministic |
 | `repair` | Feed the exact Databricks error + prior code back to a stronger model, constrained to keep each object in its existing method (SQL vs PySpark), re-validate | **LLM** |
 | `report` | Write `run_summary` + `recon_inventory` (every source object accounted for); the dashboard reads these | deterministic |
@@ -36,6 +36,29 @@ the LLM is spent only where procedural T-SQL genuinely needs it.
    ```
 4. Open the **T-SQL Migration Monitor** dashboard to track the funnel, per-type success, failure
    classes, and the review queue.
+
+### Temporal (system-versioned) tables → SCD Type 2
+SQL Server temporal tables (`SYSTEM_VERSIONING = ON`, `PERIOD FOR SYSTEM_TIME`,
+`GENERATED ALWAYS AS ROW START/END`) have no Delta equivalent. Left to the LLM they get
+silently flattened — the period columns become plain timestamps, system-versioning is
+dropped, and the result still "passes" validation while losing all history semantics.
+
+Instead the `normalize` task **detects them and deterministically** emits a faithful SCD2
+translation (no LLM):
+- an **SCD2 Delta table** that keeps the validity window (`<start>`/`<end>`), adds an
+  `IsCurrent` flag, sets the open-row sentinel `TIMESTAMP '9999-12-31 23:59:59.999'`, and
+  enables **Change Data Feed**;
+- a companion **`<table>_scd2_apply(p_effective_at TIMESTAMP)`** procedure that maintains
+  history with the standard close-out-then-insert MERGE (reads desired current state from a
+  `<table>_scd2_source` temp view);
+- a commented **one-time backfill** that folds the old history table in.
+
+The SCD2 **business key is inferred** — the primary key minus any IDENTITY surrogate, falling
+back to the `UNIQUE` constraint — so identity-keyed tables version on their natural key. Audit
+columns (`ETL_*`) are excluded from change detection. Every temporal table is surfaced in the
+`temporal_tables` report table (source → SCD2 table status + apply-proc status) so the
+conversion is reviewed explicitly rather than passing as an ordinary table. `_scd2_apply`
+procedures validate as first-class objects alongside everything else.
 
 ### Staged rollout
 Run with `fraction=0.25`, then `0.5`, `0.75`, `1.0` to validate at increasing scale and watch

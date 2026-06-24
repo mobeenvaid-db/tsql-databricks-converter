@@ -194,6 +194,7 @@ _SIG = {"has_cursor": r"\bDECLARE\b[^;]{0,120}\bCURSOR\b", "has_while": r"\bWHIL
         "has_dynamic_sql": r"\b(EXEC\s*\(|sp_executesql)\b", "has_merge": r"\bMERGE\b\s+",
         "has_try_catch": r"\bBEGIN\s+TRY\b", "has_transaction": r"\b(BEGIN\s+TRAN|COMMIT\s+TRAN|ROLLBACK)\b",
         "has_pivot": r"\b(PIVOT|UNPIVOT)\b", "has_identity": r"\bIDENTITY\s*\(",
+        "has_temporal": r"\bSYSTEM_VERSIONING\b|\bPERIOD\s+FOR\s+SYSTEM_TIME\b|\bGENERATED\s+ALWAYS\s+AS\s+ROW\b",
         "has_output_param": r"@\w+\s+\w+(\s*\([^)]*\))?\s+(OUTPUT|OUT)\b", "has_cte": r"\bWITH\b[\s\S]{0,200}\bAS\s*\("}
 _SIG_C = {k: re.compile(v, re.I) for k, v in _SIG.items()}
 
@@ -329,6 +330,158 @@ def normalize_databricks_sql(code, object_type):
     return code
 
 # COMMAND ----------
+# MAGIC %md ## Temporal (system-versioned) table -> Delta SCD Type 2 (deterministic)
+# MAGIC SQL Server temporal tables have no Delta equivalent. Left to the LLM they get
+# MAGIC silently flattened (period columns -> plain timestamps, SYSTEM_VERSIONING dropped)
+# MAGIC and still "pass" validation while losing all history semantics. Instead we detect
+# MAGIC them and deterministically emit (1) an SCD2 Delta table that keeps the validity
+# MAGIC window + an IsCurrent flag and enables Change Data Feed, (2) a companion
+# MAGIC `<table>_scd2_apply` procedure that maintains history with the standard
+# MAGIC close-out-then-insert MERGE, and (3) a one-time backfill that folds the old
+# MAGIC history table in. The business key is inferred (PK minus IDENTITY surrogate, else
+# MAGIC the UNIQUE constraint) so identity-keyed tables version on their natural key.
+
+# COMMAND ----------
+TEMPORAL_RE = re.compile(r"(?i)\bSYSTEM_VERSIONING\b")
+_TSQL_TYPE = {'nvarchar':'STRING','varchar':'STRING','char':'STRING','nchar':'STRING','text':'STRING',
+ 'ntext':'STRING','sysname':'STRING','bit':'BOOLEAN','tinyint':'TINYINT','smallint':'SMALLINT',
+ 'int':'INT','integer':'INT','bigint':'BIGINT','datetime':'TIMESTAMP','datetime2':'TIMESTAMP',
+ 'smalldatetime':'TIMESTAMP','datetimeoffset':'TIMESTAMP','date':'DATE','time':'STRING',
+ 'money':'DECIMAL(19,4)','smallmoney':'DECIMAL(19,4)','float':'DOUBLE','real':'FLOAT',
+ 'uniqueidentifier':'STRING','xml':'STRING','binary':'BINARY','varbinary':'BINARY',
+ 'image':'BINARY','rowversion':'BINARY','timestamp':'BINARY'}
+def _map_tsql_type(t, args):
+    t = (t or "").lower().strip()
+    if t in ('decimal', 'numeric'):
+        return f"DECIMAL({args})" if args and args.lower() != 'max' else "DECIMAL(38,18)"
+    return _TSQL_TYPE.get(t, 'STRING')
+def _match_paren(s, open_idx):
+    depth = 0
+    for i in range(open_idx, len(s)):
+        if s[i] == '(': depth += 1
+        elif s[i] == ')':
+            depth -= 1
+            if depth == 0: return i
+    return -1
+def _split_top(body):
+    out, depth, cur = [], 0, []
+    for ch in body:
+        if ch == '(': depth += 1
+        elif ch == ')': depth -= 1
+        if ch == ',' and depth == 0: out.append(''.join(cur)); cur = []
+        else: cur.append(ch)
+    if ''.join(cur).strip(): out.append(''.join(cur))
+    return out
+def parse_temporal_table(sql):
+    """Parse an SSMS-scripted system-versioned CREATE TABLE. Returns a metadata dict
+    or None if the DDL is not a temporal table."""
+    if not TEMPORAL_RE.search(sql or ""): return None
+    m = re.search(r"(?is)CREATE\s+TABLE\s+\[(?P<sch>[^\]]+)\]\.\[(?P<tab>[^\]]+)\]\s*\(", sql)
+    if not m: return None
+    open_idx = sql.index('(', m.end() - 1); close_idx = _match_paren(sql, open_idx)
+    if close_idx < 0: return None
+    cols, pk, unique, period = [], [], [], []
+    for part in _split_top(sql[open_idx + 1:close_idx]):
+        p = part.strip()
+        if not p: continue
+        up = p.upper()
+        if up.startswith('PERIOD FOR SYSTEM_TIME'):
+            period = re.findall(r"\[([^\]]+)\]", p); continue
+        if 'PRIMARY KEY' in up:
+            pk = [a or b for a, b in re.findall(r"\[([^\]]+)\]\s+ASC|\[([^\]]+)\]\s+DESC", p)]; continue
+        if 'UNIQUE' in up:
+            unique = [a or b for a, b in re.findall(r"\[([^\]]+)\]\s+ASC|\[([^\]]+)\]\s+DESC", p)]; continue
+        if up.startswith(('CONSTRAINT', 'CHECK', 'FOREIGN KEY')): continue
+        cm = re.match(r"\[(?P<n>[^\]]+)\]\s*\[(?P<t>\w+)\](?:\s*\((?P<a>[^)]*)\))?(?P<rest>.*)", p, re.S)
+        if not cm: continue
+        rest = cm.group('rest') or ''
+        cols.append({'name': cm.group('n'), 'type': _map_tsql_type(cm.group('t'), cm.group('a')),
+                     'not_null': bool(re.search(r"(?i)NOT\s+NULL", rest)),
+                     'identity': bool(re.search(r"(?i)IDENTITY", rest)),
+                     'row_start': bool(re.search(r"(?i)ROW\s+START", rest)),
+                     'row_end': bool(re.search(r"(?i)ROW\s+END", rest)), 'default': None})
+    for dm in re.finditer(r"(?is)ALTER\s+TABLE.+?ADD\s+(?:CONSTRAINT\s+\[[^\]]+\]\s+)?DEFAULT\s*\((?P<d>.*?)\)\s*FOR\s+\[(?P<c>[^\]]+)\]", sql):
+        d = re.sub(r"(?i)getdate\(\)|getutcdate\(\)|sysutcdatetime\(\)", "current_timestamp()", dm.group('d').strip())
+        for c in cols:
+            if c['name'].lower() == dm.group('c').lower(): c['default'] = d
+    hist = re.search(r"(?i)HISTORY_TABLE\s*=\s*\[(?P<hs>[^\]]+)\]\.\[(?P<ht>[^\]]+)\]", sql)
+    if not period: return None
+    return {'schema': m.group('sch'), 'table': m.group('tab'), 'cols': cols, 'pk': pk, 'unique': unique,
+            'period_start': period[0], 'period_end': period[1] if len(period) > 1 else None,
+            'history_schema': hist.group('hs') if hist else None,
+            'history_table': hist.group('ht') if hist else None}
+def _scd2_business_key(meta):
+    ident = {c['name'].lower() for c in meta['cols'] if c['identity']}
+    natural_pk = [c for c in meta['pk'] if c.lower() not in ident]
+    if natural_pk: return natural_pk, None
+    if meta['unique']: return meta['unique'], "business key inferred from UNIQUE constraint (PK is an IDENTITY surrogate)"
+    nonkey = [c['name'] for c in meta['cols'] if not c['row_start'] and not c['row_end']
+              and not c['identity'] and not c['name'].upper().startswith('ETL_')]
+    return nonkey, "no natural key found; using all non-audit business columns as the SCD2 key — REVIEW"
+def _q(n): return f"`{n}`"
+def scd2_table_ddl(meta, catalog):
+    fq = f"{catalog}.{_q(meta['schema'])}.{_q(meta['table'])}"
+    ps, pe = meta['period_start'], meta['period_end']
+    lines, has_default = [], False
+    for c in meta['cols']:
+        if c['name'] in (ps, pe): lines.append(f"  {_q(c['name'])} TIMESTAMP NOT NULL"); continue
+        t = "BIGINT GENERATED BY DEFAULT AS IDENTITY" if c['identity'] else c['type']
+        seg = f"  {_q(c['name'])} {t}"
+        if c['not_null']: seg += " NOT NULL"
+        if c['default']: seg += f" DEFAULT {c['default']}"; has_default = True
+        lines.append(seg)
+    lines.append(f"  {_q('IsCurrent')} BOOLEAN NOT NULL")
+    bk, note = _scd2_business_key(meta)
+    lines.append(f"  CONSTRAINT {_q(meta['table'] + '_scd2_pk')} PRIMARY KEY "
+                 f"({', '.join(_q(c) for c in bk + [ps])}) NOT ENFORCED")
+    props = ["'delta.enableChangeDataFeed' = 'true'"]
+    if has_default: props.append("'delta.feature.allowColumnDefaults' = 'supported'")
+    ddl = (f"CREATE TABLE IF NOT EXISTS {fq} (\n" + ",\n".join(lines) +
+           f"\n)\nUSING DELTA\nTBLPROPERTIES ({', '.join(props)});")
+    notes = [f"-- MIGRATION_NOTE: SQL Server SYSTEM-VERSIONED temporal table -> Delta SCD Type 2. "
+             f"`{ps}`/`{pe}` are the validity window (open rows: {pe} = TIMESTAMP '9999-12-31 23:59:59.999'); "
+             f"`IsCurrent` flags the live version. History table "
+             f"[{meta['history_schema']}].[{meta['history_table']}] folds in via the backfill below. CDF enabled.",
+             f"-- MIGRATION_NOTE: SCD2 business key = ({', '.join(bk)}). Maintain via the companion "
+             f"`{meta['table']}_scd2_apply` procedure; never plain-UPDATE rows."]
+    if note: notes.append(f"-- MIGRATION_NOTE: {note}.")
+    backfill = scd2_backfill(meta, catalog)
+    return ddl + "\n" + "\n".join(notes) + "\n" + backfill
+def scd2_apply_proc(meta, catalog):
+    fq = f"{catalog}.{_q(meta['schema'])}.{_q(meta['table'])}"
+    ps, pe = meta['period_start'], meta['period_end']
+    bk, _ = _scd2_business_key(meta)
+    business = [c['name'] for c in meta['cols'] if c['name'] not in (ps, pe) and not c['identity']]
+    track = [c for c in business if c not in bk and not c.upper().startswith('ETL_')]
+    src = f"{meta['table']}_scd2_source"
+    join = " AND ".join(f"t.{_q(k)} = s.{_q(k)}" for k in bk)
+    changed = " OR ".join(f"NOT (t.{_q(c)} <=> s.{_q(c)})" for c in track) or "FALSE"
+    ins_cols = business + [ps, pe, 'IsCurrent']
+    ins_vals = [f"s.{_q(c)}" for c in business] + ["p_effective_at", "TIMESTAMP '9999-12-31 23:59:59.999'", "TRUE"]
+    return (f"CREATE OR REPLACE PROCEDURE {catalog}.{_q(meta['schema'])}.{_q(meta['table'] + '_scd2_apply')}"
+            f"(p_effective_at TIMESTAMP)\nLANGUAGE SQL\nSQL SECURITY INVOKER\nAS\nBEGIN\n"
+            f"  -- Caller stages the desired current state in TEMPORARY VIEW `{src}` (business columns only).\n"
+            f"  -- 1) Close out current rows whose tracked columns changed.\n"
+            f"  MERGE INTO {fq} t\n  USING {src} s ON {join} AND t.{_q('IsCurrent')} = TRUE\n"
+            f"  WHEN MATCHED AND ({changed}) THEN UPDATE SET t.{_q(pe)} = p_effective_at, t.{_q('IsCurrent')} = FALSE;\n"
+            f"  -- 2) Insert a new current version for new keys and for keys whose current row was just closed.\n"
+            f"  INSERT INTO {fq} ({', '.join(_q(c) for c in ins_cols)})\n  SELECT {', '.join(ins_vals)}\n"
+            f"  FROM {src} s\n  LEFT JOIN {fq} t ON {join} AND t.{_q('IsCurrent')} = TRUE\n"
+            f"  WHERE t.{_q(bk[0])} IS NULL OR ({changed});\nEND;")
+def scd2_backfill(meta, catalog):
+    """One-time history fold-in, emitted fully commented (the raw source location is
+    customer-specific and must be filled in)."""
+    fq = f"{catalog}.{_q(meta['schema'])}.{_q(meta['table'])}"
+    ps, pe = meta['period_start'], meta['period_end']
+    business = [c['name'] for c in meta['cols'] if c['name'] not in (ps, pe) and not c['identity']]
+    cols = business + [ps, pe, 'IsCurrent']
+    sel = ", ".join(_q(c) for c in business) + f", {_q(ps)}, {_q(pe)}, ({_q(pe)} >= TIMESTAMP '9999-12-31') AS {_q('IsCurrent')}"
+    return ("-- ONE-TIME BACKFILL (uncomment + point at where the raw current+history rows land, e.g. bronze):\n"
+            f"-- INSERT INTO {fq} ({', '.join(_q(c) for c in cols)})\n"
+            f"-- SELECT {sel}\n"
+            f"-- FROM <bronze union of {meta['schema']}.{meta['table']} live rows AND its history table>;")
+
+# COMMAND ----------
 # MAGIC %md ## Validation engine (SQL Statement Execution API fan-out, in-workspace)
 
 # COMMAND ----------
@@ -418,7 +571,13 @@ def extract_main(otype, code):
     m = re.compile(rf"(?is)\bCREATE\s+(?:OR\s+REPLACE\s+)?(?:IF\s+NOT\s+EXISTS\s+)?{otype}\b").search(code)
     return code[m.start():] if m else code
 _TBL_HEAD = re.compile(r"(?is)^\s*CREATE\s+(?:OR\s+REPLACE\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?")
-def norm_table(code): return _TBL_HEAD.sub("CREATE TABLE IF NOT EXISTS ", code, count=1)
+# Validation only: force CREATE OR REPLACE so a table that already exists in the shared
+# scratch schema from a PRIOR run is genuinely re-created and re-checked. With
+# IF NOT EXISTS a stale scratch table makes the statement a no-op that "passes" without
+# validating the current DDL (e.g. a column added this run would go unverified). The
+# shipped converted_code keeps its own idempotent IF NOT EXISTS form; this rewrite
+# applies only to the statement submitted to the scratch warehouse.
+def norm_table(code): return _TBL_HEAD.sub("CREATE OR REPLACE TABLE ", code, count=1)
 def force_replace_view(code):
     return re.sub(r"(?i)\bCREATE\s+(?:OR\s+REPLACE\s+)?VIEW\s+", "CREATE OR REPLACE VIEW ", code, count=1)
 _MISS = re.compile(rf"{re.escape(SCRATCH_PREFIX)}[A-Za-z0-9_]+`?\s*\.\s*`?([A-Za-z0-9_]+)")
