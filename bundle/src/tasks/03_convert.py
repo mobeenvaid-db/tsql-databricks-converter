@@ -8,7 +8,11 @@
 # MAGIC %run ../_common
 
 # COMMAND ----------
-MAXTOK = {"trivial": 4096, "simple": 6144, "medium": 8192, "complex": 16000}
+# Output token cap per tier. Large/complex procedures (long MERGE column lists, wide
+# INSERT ... VALUES, big CASE ladders) routinely exceed the old caps and got truncated
+# mid-statement, which then failed validation as a parse error. Sized generously to the
+# output limits of the tier models (Opus/Sonnet 4.x).
+MAXTOK = {"trivial": 4096, "simple": 8192, "medium": 16000, "complex": 32000}
 has_sg = spark.catalog.tableExists(f"{FQ}._sqlglot")
 sg_ok = f"SELECT object_id FROM {FQ}._sqlglot WHERE sqlglot_code IS NOT NULL" if has_sg else None
 spark.sql(f"""
